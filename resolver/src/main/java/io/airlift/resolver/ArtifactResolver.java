@@ -17,13 +17,19 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.resolver.internal.ConsoleRepositoryListener;
 import io.airlift.resolver.internal.ConsoleTransferListener;
+import io.airlift.resolver.internal.DefaultArtifactResolver;
 import org.apache.maven.artifact.repository.ArtifactRepository;
 import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.ProjectBuilder;
 import org.apache.maven.project.ProjectBuildingRequest;
 import org.apache.maven.project.ProjectBuildingResult;
+import org.apache.maven.repository.internal.DefaultArtifactDescriptorReader;
+import org.apache.maven.repository.internal.DefaultVersionRangeResolver;
+import org.apache.maven.repository.internal.DefaultVersionResolver;
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils;
+import org.apache.maven.repository.internal.SnapshotMetadataGeneratorFactory;
+import org.apache.maven.repository.internal.VersionsMetadataGeneratorFactory;
 import org.codehaus.plexus.ContainerConfiguration;
 import org.codehaus.plexus.DefaultContainerConfiguration;
 import org.codehaus.plexus.DefaultPlexusContainer;
@@ -40,7 +46,11 @@ import org.eclipse.aether.collection.CollectRequest;
 import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory;
 import org.eclipse.aether.graph.Dependency;
 import org.eclipse.aether.graph.Exclusion;
-import org.eclipse.aether.impl.DefaultServiceLocator;
+import org.eclipse.aether.impl.ArtifactDescriptorReader;
+import org.eclipse.aether.impl.MetadataGeneratorFactory;
+import org.eclipse.aether.impl.ResolverArtifactResolver;
+import org.eclipse.aether.impl.VersionRangeResolver;
+import org.eclipse.aether.impl.VersionResolver;
 import org.eclipse.aether.repository.LocalRepository;
 import org.eclipse.aether.repository.RemoteRepository;
 import org.eclipse.aether.resolution.ArtifactResult;
@@ -84,6 +94,10 @@ public class ArtifactResolver
     private final DefaultRepositorySystemSession repositorySystemSession;
     private final List<RemoteRepository> repositories;
 
+    private ProjectBuilder projectBuilder;
+
+    private ProjectBuildingRequest builderRequest;
+
     public ArtifactResolver(String localRepositoryDir, String... remoteRepositoryUris)
     {
         this(localRepositoryDir, Arrays.asList(remoteRepositoryUris));
@@ -92,9 +106,15 @@ public class ArtifactResolver
     public ArtifactResolver(String localRepositoryDir, List<String> remoteRepositoryUris)
     {
         // TODO: move off deprecated ServiceLocator, use Sisu instead
-        DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
+        ResolverArtifactResolver locator = new ResolverArtifactResolver();
+        locator.addService(ArtifactDescriptorReader.class, DefaultArtifactDescriptorReader.class);
+        locator.addService(VersionResolver.class, DefaultVersionResolver.class);
+        locator.addService(VersionRangeResolver.class, DefaultVersionRangeResolver.class);
+        locator.addService(MetadataGeneratorFactory.class, SnapshotMetadataGeneratorFactory.class);
+        locator.addService(MetadataGeneratorFactory.class, VersionsMetadataGeneratorFactory.class);
         locator.addService(RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class);
-        locator.addService( TransporterFactory.class, FileTransporterFactory.class);
+        locator.addService(org.eclipse.aether.impl.ArtifactResolver.class, DefaultArtifactResolver.class);
+        locator.addService(TransporterFactory.class, FileTransporterFactory.class);
         locator.addService(TransporterFactory.class, HttpTransporterFactory.class);
         repositorySystem = locator.getService(RepositorySystem.class);
 
@@ -104,6 +124,9 @@ public class ArtifactResolver
 
         repositorySystemSession.setTransferListener(new ConsoleTransferListener());
         repositorySystemSession.setRepositoryListener(new ConsoleRepositoryListener());
+
+        // Recreating ProjectBuilder & ProjectBuilderRequest caused major slowdowns
+        buildProjectBuilder();
 
         List<RemoteRepository> repositories = new ArrayList<>(remoteRepositoryUris.size());
         int index = 0;
@@ -188,9 +211,8 @@ public class ArtifactResolver
                 .collect(toImmutableList());
     }
 
-    private MavenProject getMavenProject(File pomFile)
+    private void buildProjectBuilder()
     {
-        // TODO: move off deprecated org.apache.maven.repository.RepositorySystem (impl is in maven2 compat module)
         try {
             PlexusContainer container = container();
             org.apache.maven.repository.RepositorySystem lrs = container.lookup(org.apache.maven.repository.RepositorySystem.class);
@@ -201,7 +223,21 @@ public class ArtifactResolver
             request.setProcessPlugins(false);
             request.setLocalRepository(lrs.createDefaultLocalRepository());
             request.setRemoteRepositories(Arrays.asList(new ArtifactRepository[] {lrs.createDefaultRemoteRepository()}.clone()));
-            ProjectBuildingResult result = projectBuilder.build(pomFile, request);
+            this.projectBuilder = projectBuilder;
+            this.builderRequest = request;
+         }catch (Exception e) {
+            throw new RuntimeException("Error initializing project builder: ", e);
+        }
+    }
+    private MavenProject getMavenProject(File pomFile)
+    {
+        // TODO: move off deprecated org.apache.maven.repository.RepositorySystem (impl is in maven2 compat module)
+        try {
+            if (projectBuilder == null  || builderRequest == null)
+            {
+                buildProjectBuilder();
+            }
+            ProjectBuildingResult result = projectBuilder.build(pomFile, builderRequest);
             return result.getProject();
         }
         catch (Exception e) {
