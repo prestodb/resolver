@@ -90,6 +90,16 @@ public class ArtifactResolver
             .add("http://repo.maven.apache.org/maven2/")
             .build();
 
+    private static final String MAVEN_REPOSITORY_SYSTEM_CLASS = "org.apache.maven.repository.RepositorySystem";
+    private static final String PLEXUS_CONTAINER_CLASS = "org.codehaus.plexus.DefaultPlexusContainer";
+    private static final String AETHER_REPOSITORY_SYSTEM_CLASS = "org.eclipse.aether.RepositorySystem";
+
+    /**
+     * Cached effective ClassLoader to avoid repeated Class.forName checks on every container() call.
+     * Initialized lazily on first access and reused thereafter.
+     */
+    private static volatile ClassLoader cachedEffectiveClassLoader;
+
     private final RepositorySystem repositorySystem;
     private final DefaultRepositorySystemSession repositorySystemSession;
     private final List<RemoteRepository> repositories;
@@ -327,7 +337,11 @@ public class ArtifactResolver
     {
         // TODO: move off Plexus DI, use Sisu instead
         try {
-            ClassWorld classWorld = new ClassWorld("plexus.core", Thread.currentThread().getContextClassLoader());
+            // Fix for Spark and other isolated classloader environments:
+            // Select an effective ClassLoader by checking multiple candidates to ensure Maven Resolver/Plexus components are discoverable at runtime.
+            ClassLoader classLoader = getEffectiveClassLoader();
+
+            ClassWorld classWorld = new ClassWorld("plexus.core", classLoader);
 
             ContainerConfiguration cc = new DefaultContainerConfiguration()
                     .setClassWorld(classWorld)
@@ -348,6 +362,80 @@ public class ArtifactResolver
         }
         catch (PlexusContainerException e) {
             throw new RuntimeException("Error loading Maven system", e);
+        }
+    }
+
+    /**
+     * Determine a ClassLoader that can access Maven Resolver and Plexus classes.
+     * Some isolated runtimes (e.g. Spark executors) use a TCCL that cannot see
+     * resolver dependencies, so we fall back to the resolver's defining loader.
+     */
+    private static ClassLoader getEffectiveClassLoader()
+    {
+        // First check without synchronization (fast path for already cached value)
+        ClassLoader cached = cachedEffectiveClassLoader;
+        if (cached != null) {
+            return cached;
+        }
+
+        // Synchronize for initialization to prevent race conditions
+        synchronized (ArtifactResolver.class) {
+            // Double-check after acquiring lock
+            cached = cachedEffectiveClassLoader;
+            if (cached != null) {
+                return cached;
+            }
+
+            ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+            if (contextClassLoader != null && canLoadMavenComponents(contextClassLoader)) {
+                cachedEffectiveClassLoader = contextClassLoader;
+                return cachedEffectiveClassLoader;
+            }
+
+            ClassLoader thisClassLoader = ArtifactResolver.class.getClassLoader();
+            if (thisClassLoader != null && canLoadMavenComponents(thisClassLoader)) {
+                cachedEffectiveClassLoader = thisClassLoader;
+                return cachedEffectiveClassLoader;
+            }
+
+            ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
+            if (systemClassLoader != null && canLoadMavenComponents(systemClassLoader)) {
+                cachedEffectiveClassLoader = systemClassLoader;
+                return cachedEffectiveClassLoader;
+            }
+
+            ClassLoader fallback = systemClassLoader != null ? systemClassLoader : thisClassLoader;
+            if (fallback == null) {
+                throw new IllegalStateException("Unable to determine a valid ClassLoader for Maven component initialization. " +
+                        "Both system ClassLoader and class ClassLoader are null, and no other ClassLoader can load required Maven components.");
+            }
+            cachedEffectiveClassLoader = fallback;
+
+            return cachedEffectiveClassLoader;
+        }
+    }
+
+    /**
+     * Verify whether the provided ClassLoader has visibility into essential Maven
+     * and Plexus components required for resolver initialization.
+     *
+     * @param classLoader the ClassLoader to validate
+     * @return true if required Maven and Plexus classes are visible to the ClassLoader;
+     * false otherwise
+     */
+    private static boolean canLoadMavenComponents(ClassLoader classLoader)
+    {
+        try {
+            // Verify visibility of a core Maven repository component
+            Class.forName(MAVEN_REPOSITORY_SYSTEM_CLASS, false, classLoader);
+            // Verify visibility of the Plexus container used for component discovery
+            Class.forName(PLEXUS_CONTAINER_CLASS, false, classLoader);
+            // Verify visibility of Maven Resolver API (critical for dependency resolution)
+            Class.forName(AETHER_REPOSITORY_SYSTEM_CLASS, false, classLoader);
+            return true;
+        }
+        catch (ClassNotFoundException e) {
+            return false;
         }
     }
 }
