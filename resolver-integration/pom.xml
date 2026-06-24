@@ -9,6 +9,7 @@
 
     <artifactId>resolver-integration</artifactId>
     <packaging>jar</packaging>
+    <name>${project.artifactId}</name>
 
     <properties>
         <air.check.skip-jacoco>true</air.check.skip-jacoco>
